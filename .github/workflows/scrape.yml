@@ -2,7 +2,7 @@ name: scrape-instagram
 
 on:
   schedule:
-    - cron: "0 15 * * *" # 23:00 Asia/Taipei = 15:00 UTC
+    - cron: "0 15 * * *"  # 23:00 Asia/Taipei = 15:00 UTC
   workflow_dispatch:
 
 concurrency:
@@ -12,8 +12,12 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
+
+    env:
+      TZ: Asia/Taipei
 
     steps:
       - name: Checkout repository
@@ -26,7 +30,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Set up Chrome and ChromeDriver
+      - name: Set up Chrome + ChromeDriver
         id: setup-chrome
         uses: browser-actions/setup-chrome@v2
         with:
@@ -35,8 +39,6 @@ jobs:
 
       - name: Show browser versions
         run: |
-          echo "Chrome path: ${{ steps.setup-chrome.outputs.chrome-path }}"
-          echo "ChromeDriver path: ${{ steps.setup-chrome.outputs.chromedriver-path }}"
           "${{ steps.setup-chrome.outputs.chrome-path }}" --version
           "${{ steps.setup-chrome.outputs.chromedriver-path }}" --version
 
@@ -55,35 +57,28 @@ jobs:
 
       - name: Ensure data files exist
         run: |
-          mkdir -p data
-          [ -f data/kol_info.csv ] || printf "kol_account\ninstagram\n" > data/kol_info.csv
+          mkdir -p data data/debug
           [ -f data/reels_static_info.csv ] || printf "kol_account,reels_shortcode,post_time,duration,caption\n" > data/reels_static_info.csv
           [ -f data/reels_dynamic_info.csv ] || printf "reels_shortcode,views,plays,likes,comments,timestamp\n" > data/reels_dynamic_info.csv
           [ -f data/profile_post_state.csv ] || printf "kol_account,profile_post_count,last_checked_at,last_changed_at,check_status\n" > data/profile_post_state.csv
 
       - name: Run scraper
         env:
-          TZ: Asia/Taipei
           CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
           CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
         run: |
-          python -u main.py
+          python main.py
 
-      - name: Save debug HTML on failure
-        if: failure()
-        env:
-          TZ: Asia/Taipei
-          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
-          CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
-        run: |
-          python debug_html.py || true
-
-      - name: Upload debug artifact on failure
-        if: failure()
+      - name: Upload scrape artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: instagram-debug-html
-          path: debug/
+          name: scrape-debug
+          path: |
+            data/debug/
+            data/*.csv
+            *.log
+            /tmp/insta_debug.html
           if-no-files-found: ignore
 
       - name: Commit and push CSV updates
