@@ -20,16 +20,18 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 # ========= Basic config =========
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
+DEBUG_DIR = DATA_DIR / "debug"
 KOL_INFO_FILE = DATA_DIR / "kol_info.csv"
 STATE_FILE = DATA_DIR / "profile_post_state.csv"
 STATIC_FILE = DATA_DIR / "reels_static_info.csv"
 DYNAMIC_FILE = DATA_DIR / "reels_dynamic_info.csv"
 
 REELS_WINDOW_DAYS = int(os.environ.get("REELS_WINDOW_DAYS", "30"))
-PROFILE_SLEEP_RANGE = (0.8, 1.5)
-DETAIL_SLEEP_RANGE = (0.8, 1.5)
-MAX_PROFILE_SCROLLS = int(os.environ.get("MAX_PROFILE_SCROLLS", "3"))
-PAGE_TIMEOUT_SECONDS = int(os.environ.get("PAGE_TIMEOUT_SECONDS", "20"))
+PROFILE_SLEEP_RANGE = (1.2, 2.4)
+DETAIL_SLEEP_RANGE = (1.0, 1.8)
+MAX_PROFILE_SCROLLS = int(os.environ.get("MAX_PROFILE_SCROLLS", "4"))
+PAGE_TIMEOUT_SECONDS = int(os.environ.get("PAGE_TIMEOUT_SECONDS", "25"))
+PROFILE_RETRY_ATTEMPTS = int(os.environ.get("PROFILE_RETRY_ATTEMPTS", "3"))
 
 STATIC_COLUMNS = [
     "kol_account",
@@ -56,6 +58,15 @@ STATE_COLUMNS = [
     "check_status",
 ]
 
+DEFAULT_USER_AGENT = os.environ.get(
+    "SCRAPER_USER_AGENT",
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+)
+
 
 # ========= Helpers =========
 def now_local() -> dt.datetime:
@@ -73,6 +84,11 @@ def sleep_random(sec_range: tuple[float, float]) -> None:
 def ensure_parent_dir(filepath: Path | str) -> None:
     parent = Path(filepath).parent
     parent.mkdir(parents=True, exist_ok=True)
+
+
+def slugify_username(username: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", username.strip())
+    return cleaned or "unknown"
 
 
 def read_or_init_csv(filepath: Path, columns: list[str]) -> pd.DataFrame:
@@ -218,6 +234,39 @@ def parse_dt_string(value: str | None) -> Optional[dt.datetime]:
         return None
 
 
+def save_debug_artifacts(driver: webdriver.Chrome, username: str, label: str) -> None:
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"{slugify_username(username)}_{label}_{now_local().strftime('%Y%m%d_%H%M%S')}"
+    html_path = DEBUG_DIR / f"{stem}.html"
+    png_path = DEBUG_DIR / f"{stem}.png"
+    txt_path = DEBUG_DIR / f"{stem}.txt"
+
+    page_source = driver.page_source or ""
+    html_path.write_text(page_source, encoding="utf-8")
+
+    try:
+        driver.save_screenshot(str(png_path))
+    except Exception:
+        pass
+
+    try:
+        txt_path.write_text(
+            "\n".join(
+                [
+                    f"url={driver.current_url}",
+                    f"title={driver.title}",
+                    f"html_length={len(page_source)}",
+                    f"body_text_sample={(driver.find_element(By.TAG_NAME, 'body').text or '')[:1500]}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    print(f"ℹ️ Saved debug artifacts for {username} -> {html_path.name}")
+
+
 # ========= Selenium =========
 def resolve_browser_binary() -> Optional[str]:
     env_bin = os.environ.get("CHROME_BIN")
@@ -240,11 +289,8 @@ def resolve_chromedriver() -> Optional[str]:
     if env_path and Path(env_path).exists():
         return env_path
 
-    for candidate in ["chromedriver"]:
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    return None
+    resolved = shutil.which("chromedriver")
+    return resolved if resolved else None
 
 
 def build_driver() -> webdriver.Chrome:
@@ -252,12 +298,13 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1440,2200")
+    options.add_argument("--window-size=1440,2600")
     options.add_argument("--lang=en-US")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-gpu")
     options.add_argument("--hide-scrollbars")
     options.add_argument("--log-level=3")
+    options.add_argument(f"--user-agent={DEFAULT_USER_AGENT}")
     options.page_load_strategy = "eager"
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
@@ -299,6 +346,49 @@ def safe_get(driver: webdriver.Chrome, url: str) -> bool:
         return False
 
 
+def wait_for_profile_surface(driver: webdriver.Chrome) -> None:
+    patterns = [
+        "//meta[@property='og:description']",
+        "//meta[@name='description']",
+        "//a[contains(@href, '/reel/')]",
+        "//header",
+        "//main",
+    ]
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        for xpath in patterns:
+            try:
+                if driver.find_elements(By.XPATH, xpath):
+                    time.sleep(0.8)
+                    return
+            except Exception:
+                continue
+        time.sleep(0.5)
+
+
+def page_looks_blocked_or_login(driver: webdriver.Chrome) -> bool:
+    title = (driver.title or "").lower()
+    html_text = (driver.page_source or "").lower()
+    body_text = ""
+    try:
+        body_text = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+    except Exception:
+        pass
+
+    indicators = [
+        "log in",
+        "login",
+        "sign up",
+        "challenge_required",
+        "we suspect automated behavior",
+        "please wait a few minutes",
+        "something went wrong",
+    ]
+    haystack = "\n".join([title, html_text[:3000], body_text[:1500]])
+    return any(token in haystack for token in indicators)
+
+
 def extract_post_count_from_page_source(driver: webdriver.Chrome) -> Optional[int]:
     html_text = driver.page_source or ""
     count = _find_first(
@@ -306,6 +396,8 @@ def extract_post_count_from_page_source(driver: webdriver.Chrome) -> Optional[in
             r'edge_owner_to_timeline_media\\":\\\{\\"count\\":(\d+)',
             r'"edge_owner_to_timeline_media"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
             r'"posts"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+            r'"posts_count"\s*:\s*(\d+)',
+            r'"media_count"\s*:\s*(\d+)',
         ],
         html_text,
     )
@@ -313,27 +405,33 @@ def extract_post_count_from_page_source(driver: webdriver.Chrome) -> Optional[in
 
 
 def extract_post_count_from_meta(driver: webdriver.Chrome) -> Optional[int]:
-    try:
-        metas = driver.find_elements(By.XPATH, "//meta[@property='og:description']")
-    except Exception:
-        return None
+    xpaths = [
+        "//meta[@property='og:description']",
+        "//meta[@name='description']",
+    ]
 
-    for meta in metas:
-        content = (meta.get_attribute("content") or "").strip()
-        if not content:
-            continue
+    for xpath in xpaths:
+        try:
+            metas = driver.find_elements(By.XPATH, xpath)
+        except Exception:
+            metas = []
 
-        match = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+posts?\b", content, flags=re.I)
-        if match:
-            count = normalize_count_text(match.group(1))
-            if count is not None:
-                return count
+        for meta in metas:
+            content = (meta.get_attribute("content") or "").strip()
+            if not content:
+                continue
 
-        match = re.search(r"^\s*([0-9][0-9,\.KMBkmb]*)\b", content)
-        if match:
-            count = normalize_count_text(match.group(1))
-            if count is not None:
-                return count
+            match = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+posts?\b", content, flags=re.I)
+            if match:
+                count = normalize_count_text(match.group(1))
+                if count is not None:
+                    return count
+
+            match = re.search(r"^\s*([0-9][0-9,\.KMBkmb]*)\b", content)
+            if match:
+                count = normalize_count_text(match.group(1))
+                if count is not None:
+                    return count
 
     return None
 
@@ -344,6 +442,7 @@ def extract_post_count_from_xpath(driver: webdriver.Chrome) -> Optional[int]:
         "//header//ul/li[1]//span/span",
         "//main//header//section//ul/li[1]//span[@title]",
         "//main//header//section//ul/li[1]//span/span",
+        "//*[contains(text(), ' posts') or contains(text(), ' post')]/ancestor::*[1]",
     ]
 
     for xpath in xpaths:
@@ -361,23 +460,33 @@ def extract_post_count_from_xpath(driver: webdriver.Chrome) -> Optional[int]:
 
 def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[int]:
     url = f"https://www.instagram.com/{username}/"
-    if not safe_get(driver, url):
-        return None
 
-    for extractor_name, extractor in [
-        ("page_source", extract_post_count_from_page_source),
-        ("meta", extract_post_count_from_meta),
-        ("xpath", extract_post_count_from_xpath),
-    ]:
-        try:
-            count = extractor(driver)
-            if count is not None:
-                print(f"ℹ️ {username} current profile post count ({extractor_name}): {count}")
-                return count
-        except Exception as exc:
-            print(f"⚠️ {username} post count extractor {extractor_name} failed: {exc}")
+    for attempt in range(1, PROFILE_RETRY_ATTEMPTS + 1):
+        if not safe_get(driver, url):
+            continue
 
-    print(f"⚠️ Could not read post count for {username}")
+        wait_for_profile_surface(driver)
+
+        for extractor_name, extractor in [
+            ("page_source", extract_post_count_from_page_source),
+            ("meta", extract_post_count_from_meta),
+            ("xpath", extract_post_count_from_xpath),
+        ]:
+            try:
+                count = extractor(driver)
+                if count is not None:
+                    print(f"ℹ️ {username} current profile post count ({extractor_name}): {count}")
+                    return count
+            except Exception as exc:
+                print(f"⚠️ {username} post count extractor {extractor_name} failed: {exc}")
+
+        blocked = page_looks_blocked_or_login(driver)
+        print(f"⚠️ Could not read post count for {username} (attempt {attempt}/{PROFILE_RETRY_ATTEMPTS}, blocked={blocked})")
+        save_debug_artifacts(driver, username, f"profile_count_fail_attempt{attempt}")
+
+        if attempt < PROFILE_RETRY_ATTEMPTS:
+            time.sleep(1.5 * attempt)
+
     return None
 
 
@@ -474,9 +583,9 @@ def _extract_reel_caption(html_text: str, json_ld_objects: list[dict]) -> str:
 
     raw = _find_first(
         [
-            r'"caption":\{"text":"(.*?)"\}',
-            r'"accessibility_caption":"(.*?)"',
-            r'<meta[^>]+property="og:description"[^>]+content="(.*?)"',
+            r'"accessibility_caption":"([^"]+)"',
+            r'"caption":"([^"]+)"',
+            r'"text":"([^"]+)"',
         ],
         html_text,
         flags=re.S,
@@ -486,19 +595,23 @@ def _extract_reel_caption(html_text: str, json_ld_objects: list[dict]) -> str:
 
 def _extract_reel_duration(html_text: str, json_ld_objects: list[dict]) -> Optional[float]:
     for obj in json_ld_objects:
-        if "duration" in obj and isinstance(obj["duration"], str):
-            iso_duration = obj["duration"]
-            match = re.fullmatch(r"PT(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", iso_duration)
+        value = obj.get("duration")
+        if isinstance(value, str):
+            match = re.search(r"PT(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", value)
             if match:
                 minutes = float(match.group(1) or 0)
                 seconds = float(match.group(2) or 0)
-                return minutes * 60 + seconds
+                return round(minutes * 60 + seconds, 2)
 
-    raw = _find_first([r'"video_duration":([0-9.]+)'], html_text)
-    if raw is None:
-        return None
+    raw = _find_first(
+        [
+            r'"video_duration":([0-9.]+)',
+            r'"duration":([0-9.]+)',
+        ],
+        html_text,
+    )
     try:
-        return float(raw)
+        return float(raw) if raw is not None else None
     except Exception:
         return None
 
@@ -506,9 +619,6 @@ def _extract_reel_duration(html_text: str, json_ld_objects: list[dict]) -> Optio
 def _extract_metric_from_json_ld(json_ld_objects: list[dict], metric_name: str) -> Optional[int]:
     for obj in json_ld_objects:
         stats = obj.get("interactionStatistic")
-        if not stats:
-            continue
-
         if isinstance(stats, dict):
             stats = [stats]
         if not isinstance(stats, list):
@@ -534,11 +644,16 @@ def get_reel_detail_by_shortcode(shortcode: str, driver: webdriver.Chrome) -> Op
     if not safe_get(driver, url):
         return None
 
-    time.sleep(0.5)
+    time.sleep(0.8)
     html_text = driver.page_source or ""
     if not html_text:
         print(f"⚠️ Empty HTML for reel {shortcode}")
+        save_debug_artifacts(driver, shortcode, "reel_empty")
         return None
+
+    if page_looks_blocked_or_login(driver):
+        print(f"⚠️ Reel page looks blocked/login for {shortcode}")
+        save_debug_artifacts(driver, shortcode, "reel_blocked")
 
     json_ld_objects = _extract_json_ld_objects(html_text)
 
@@ -600,6 +715,7 @@ def extract_recent_reels_from_profile_page(
     shortcodes = extract_reel_shortcodes_from_profile(driver)
     if not shortcodes:
         print(f"⚠️ {username} no reel links found on profile page")
+        save_debug_artifacts(driver, username, "profile_no_reel_links")
         return []
 
     print(f"ℹ️ {username} reel links discovered on profile page: {len(shortcodes)}")
@@ -689,6 +805,7 @@ def upsert_state_row(
 def main() -> None:
     start_ts = time.time()
     ensure_parent_dir(KOL_INFO_FILE)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
     if not KOL_INFO_FILE.exists():
         print(f"⚠️ {KOL_INFO_FILE} not found, creating sample file")
@@ -744,7 +861,34 @@ def main() -> None:
             processed += 1
 
             if current_count is None:
-                state_df = upsert_state_row(state_df, username, previous_count, "count_read_failed", False)
+                print(f"ℹ️ Falling back to direct reel scan for {username}")
+                if safe_get(driver, f"https://www.instagram.com/{username}/"):
+                    wait_for_profile_surface(driver)
+                    recent_reels = extract_recent_reels_from_profile_page(driver, username, existing_shortcodes)
+                else:
+                    recent_reels = []
+
+                if recent_reels:
+                    print(f"ℹ️ {username} fallback new reels to append: {len(recent_reels)}")
+                    for detail in recent_reels:
+                        new_static_rows.append(build_static_row(username, detail))
+                        new_dynamic_rows.append(build_dynamic_snapshot(detail))
+                    changed_accounts += 1
+                    state_df = upsert_state_row(
+                        state_df,
+                        username,
+                        previous_count,
+                        "count_read_failed_fallback_saved",
+                        True,
+                    )
+                else:
+                    state_df = upsert_state_row(
+                        state_df,
+                        username,
+                        previous_count,
+                        "count_read_failed",
+                        False,
+                    )
                 sleep_random(PROFILE_SLEEP_RANGE)
                 continue
 
