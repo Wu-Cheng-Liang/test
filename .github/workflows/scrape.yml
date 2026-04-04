@@ -2,8 +2,7 @@ name: scrape-instagram
 
 on:
   schedule:
-  - cron: "0 23 * * *"
-    timezone: "Asia/Taipei"
+    - cron: "0 15 * * *"  # 23:00 Asia/Taipei = 15:00 UTC
   workflow_dispatch:
 
 concurrency:
@@ -27,6 +26,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set up Chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -45,10 +48,12 @@ jobs:
           mkdir -p data
           [ -f data/reels_static_info.csv ] || printf "kol_account,reels_shortcode,post_time,duration,caption\n" > data/reels_static_info.csv
           [ -f data/reels_dynamic_info.csv ] || printf "reels_shortcode,views,plays,likes,comments,timestamp\n" > data/reels_dynamic_info.csv
+          [ -f data/profile_post_state.csv ] || printf "kol_account,profile_post_count,last_checked_at,last_changed_at,check_status\n" > data/profile_post_state.csv
 
       - name: Run scraper
         env:
           TZ: Asia/Taipei
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: |
           python main.py
 
