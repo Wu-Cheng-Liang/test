@@ -4,6 +4,7 @@ import time
 import random
 import datetime
 import os
+import json
 
 
 # ========= 基本設定 =========
@@ -17,9 +18,16 @@ DETAIL_API = "https://www.instagram.com/graphql/query/"
 DETAIL_DOC_ID = "8845758582119845"
 IG_APP_ID = "936619743392459"
 
-NEW_REELS_WINDOW_MINUTES = 30
-PROFILE_SLEEP_RANGE = (3, 6)
-DETAIL_SLEEP_RANGE = (2, 4)
+# 新貼文偵測視窗
+NEW_REELS_WINDOW_MINUTES = 2880
+
+# 節流
+PROFILE_SLEEP_RANGE = (6, 10)
+DETAIL_SLEEP_RANGE = (4, 7)
+
+# 抗封設定
+COOLDOWN_SECONDS_ON_401 = 180
+MAX_CONSECUTIVE_401 = 3
 
 BASE_HEADERS = {
     "user-agent": (
@@ -48,9 +56,16 @@ DYNAMIC_COLUMNS = [
 ]
 
 
-# ========= 工具函式 =========
+# ========= 工具 =========
 def now_local():
     return datetime.datetime.now()
+
+
+def parse_datetime_safe(value):
+    try:
+        return datetime.datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
 
 def sleep_random(sec_range):
@@ -70,12 +85,9 @@ def read_or_init_csv(filepath, columns):
         try:
             df = pd.read_csv(filepath)
             print(f"✅ 成功讀取 {filepath}")
-
-            # 補齊缺少欄位
             for col in columns:
                 if col not in df.columns:
                     df[col] = None
-
             return df[columns]
         except Exception as e:
             print(f"⚠️ 讀取 {filepath} 失敗，改用空表：{e}")
@@ -109,6 +121,11 @@ def safe_json_get(url, headers, referer=None, timeout=15):
         )
         print(f"DEBUG GET {url} status={resp.status_code}")
 
+        if resp.status_code == 401:
+            print("⚠️ 收到 401，可能被限流")
+            print(resp.text[:300])
+            return {"_error_status": 401, "_raw_text": resp.text[:300]}
+
         if resp.status_code != 200:
             print(f"❌ GET 失敗 status={resp.status_code}")
             print(resp.text[:300])
@@ -131,13 +148,7 @@ def get_profile_info(username):
     )
 
 
-def extract_recent_new_reels_from_profile(username, profile_json, existing_shortcodes, within_minutes=30):
-    """
-    從 profile timeline 裡找：
-    1. 是影片
-    2. 發文時間在最近 30 分鐘內
-    3. shortcode 不在 static CSV
-    """
+def extract_recent_new_reels_from_profile(username, profile_json, existing_shortcodes, within_minutes=60):
     results = []
 
     try:
@@ -210,6 +221,11 @@ def get_reel_detail_by_shortcode(shortcode):
 
         print(f"DEBUG GET {resp.url} status={resp.status_code}")
 
+        if resp.status_code == 401:
+            print("⚠️ Detail API 收到 401，可能被限流")
+            print(resp.text[:300])
+            return {"_error_status": 401, "_raw_text": resp.text[:300]}
+
         if resp.status_code != 200:
             print(f"❌ GET 失敗 status={resp.status_code}")
             print(resp.text[:300])
@@ -268,8 +284,6 @@ def append_static_rows(static_df, new_rows):
 
     new_df = pd.DataFrame(new_rows)
     merged = pd.concat([static_df, new_df], ignore_index=True)
-
-    # 同一支 reel 只保留一筆 static 資料
     merged = merged.drop_duplicates(subset=["reels_shortcode"], keep="first")
     return merged
 
@@ -280,59 +294,50 @@ def append_dynamic_rows(dynamic_df, new_rows):
 
     new_df = pd.DataFrame(new_rows)
     merged = pd.concat([dynamic_df, new_df], ignore_index=True)
-
-    # 避免同一輪重複寫入同 shortcode + timestamp
     merged = merged.drop_duplicates(subset=["reels_shortcode", "timestamp"], keep="last")
     return merged
 
 
 def sort_static_df(df):
     if "post_time" in df.columns:
-        try:
-            df["_sort_post_time"] = pd.to_datetime(df["post_time"], errors="coerce")
-            df = df.sort_values(["_sort_post_time", "reels_shortcode"], ascending=[False, True])
-            df = df.drop(columns=["_sort_post_time"])
-        except Exception:
-            pass
+        df["_sort_post_time"] = pd.to_datetime(df["post_time"], errors="coerce")
+        df = df.sort_values(["_sort_post_time", "reels_shortcode"], ascending=[False, True])
+        df = df.drop(columns=["_sort_post_time"])
     return df
 
 
 def sort_dynamic_df(df):
     if "timestamp" in df.columns:
-        try:
-            df["_sort_timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-            df = df.sort_values(["_sort_timestamp", "reels_shortcode"], ascending=[False, True])
-            df = df.drop(columns=["_sort_timestamp"])
-        except Exception:
-            pass
+        df["_sort_timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.sort_values(["_sort_timestamp", "reels_shortcode"], ascending=[False, True])
+        df = df.drop(columns=["_sort_timestamp"])
     return df
 
 
 # ========= 主流程 =========
 def main():
-    # 讀表一
+
+    start_ts = time.time()
+
     try:
         kol_df = pd.read_csv(KOL_INFO_FILE)
         print(f"✅ 成功讀取 {KOL_INFO_FILE}")
     except FileNotFoundError:
         raise SystemExit(f"❌ 找不到 {KOL_INFO_FILE}")
 
-    if "kol_account" not in kol_df.columns:
-        raise SystemExit("❌ 表一缺少 kol_account 欄位")
-
-    # 讀表二、表三
     static_df = read_or_init_csv(STATIC_FILE, STATIC_COLUMNS)
     dynamic_df = read_or_init_csv(DYNAMIC_FILE, DYNAMIC_COLUMNS)
 
     existing_shortcodes = set(static_df["reels_shortcode"].dropna().astype(str).tolist())
 
     # =========================
-    # Part A: 檢查每個 KOL 是否有新發 Reels（30 分鐘內）
+    # Part A: 偵測新 Reels
     # =========================
-    print("\n🚀 Part A: 檢查各 KOL 最近 30 分鐘內的新 Reels")
+    print("\n🚀 Part A: 檢查各 KOL 最近兩天內的新 Reels")
 
     new_static_rows = []
     new_dynamic_rows = []
+    consecutive_401 = 0
 
     for _, row in kol_df.iterrows():
         username = str(row["kol_account"]).strip()
@@ -341,6 +346,21 @@ def main():
 
         print(f"\n=== 檢查帳號: {username} ===")
         profile_json = get_profile_info(username)
+
+        if isinstance(profile_json, dict) and profile_json.get("_error_status") == 401:
+            consecutive_401 += 1
+            print(f"⚠️ profile 401 次數累積: {consecutive_401}")
+
+            if consecutive_401 >= MAX_CONSECUTIVE_401:
+                print(f"🧊 連續 {MAX_CONSECUTIVE_401} 次 401，停止本輪 profile 掃描")
+                break
+
+            print(f"🧊 cooldown {COOLDOWN_SECONDS_ON_401} 秒")
+            time.sleep(COOLDOWN_SECONDS_ON_401)
+            continue
+
+        consecutive_401 = 0
+
         if not profile_json:
             sleep_random(PROFILE_SLEEP_RANGE)
             continue
@@ -352,12 +372,17 @@ def main():
             within_minutes=NEW_REELS_WINDOW_MINUTES
         )
 
-        print(f"ℹ️ {username} 最近 30 分鐘內新 Reels 數量: {len(recent_new_reels)}")
+        print(f"ℹ️ {username} 最近兩天內新 Reels 數量: {len(recent_new_reels)}")
 
         for static_row in recent_new_reels:
             shortcode = static_row["reels_shortcode"]
 
             detail_node = get_reel_detail_by_shortcode(shortcode)
+            if isinstance(detail_node, dict) and detail_node.get("_error_status") == 401:
+                print(f"🧊 detail 401，cooldown {COOLDOWN_SECONDS_ON_401} 秒")
+                time.sleep(COOLDOWN_SECONDS_ON_401)
+                continue
+
             if not detail_node:
                 sleep_random(DETAIL_SLEEP_RANGE)
                 continue
@@ -379,17 +404,24 @@ def main():
     dynamic_df = append_dynamic_rows(dynamic_df, new_dynamic_rows)
 
     # =========================
-    # Part B: 對表二全部 shortcode，再抓一次最新 snapshot
+    # Part B: 更新所有追蹤 Reels
     # =========================
-    print("\n🚀 Part B: 更新表二所有 Reels 的最新動態資訊")
+    print("\n🚀 Part B: 更新所有追蹤 Reels 的最新動態資訊")
 
     all_shortcodes = static_df["reels_shortcode"].dropna().astype(str).tolist()
+    print(f"ℹ️ 本輪要更新的貼文數量: {len(all_shortcodes)}")
+
     latest_dynamic_rows = []
 
     for shortcode in all_shortcodes:
         print(f"=== 更新 shortcode: {shortcode} ===")
 
         detail_node = get_reel_detail_by_shortcode(shortcode)
+
+        if isinstance(detail_node, dict) and detail_node.get("_error_status") == 401:
+            print("🧊 detail 401，停止本輪 Part B")
+            break
+
         if not detail_node:
             sleep_random(DETAIL_SLEEP_RANGE)
             continue
@@ -401,15 +433,14 @@ def main():
 
     dynamic_df = append_dynamic_rows(dynamic_df, latest_dynamic_rows)
 
-    # 排序
     static_df = sort_static_df(static_df)
     dynamic_df = sort_dynamic_df(dynamic_df)
 
-    # 存檔
     save_csv(static_df, STATIC_FILE, STATIC_COLUMNS)
     save_csv(dynamic_df, DYNAMIC_FILE, DYNAMIC_COLUMNS)
 
-    print("\n✅ 完成")
+    elapsed = round(time.time() - start_ts, 2)
+    print(f"\n✅ 完成，總耗時 {elapsed} 秒")
     print(f"✅ 已更新 {STATIC_FILE}")
     print(f"✅ 已更新 {DYNAMIC_FILE}")
 
