@@ -2,6 +2,7 @@ import os
 import re
 import time
 import random
+import shutil
 import datetime as dt
 
 import pandas as pd
@@ -213,19 +214,59 @@ def build_driver() -> webdriver.Chrome:
     options.add_experimental_option("prefs", {"intl.accept_languages": "en,en_US"})
 
     chrome_bin = os.environ.get("CHROME_BIN")
+    if not chrome_bin:
+        for candidate in ["google-chrome", "chromium", "chromium-browser"]:
+            resolved = shutil.which(candidate)
+            if resolved:
+                chrome_bin = resolved
+                break
+
     if chrome_bin:
         options.binary_location = chrome_bin
+        print(f"ℹ️ Using browser binary: {chrome_bin}")
 
     return webdriver.Chrome(options=options)
+
+
+def extract_post_count_from_page_source(driver: webdriver.Chrome) -> int | None:
+    html = driver.page_source or ""
+    patterns = [
+        r'edge_owner_to_timeline_media\":\{\"count\":(\d+)',
+        r'edge_owner_to_timeline_media"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                continue
+
+    return None
 
 
 def extract_post_count_from_meta(driver: webdriver.Chrome) -> int | None:
     metas = driver.find_elements(By.XPATH, "//meta[@property='og:description']")
     for meta in metas:
-        content = meta.get_attribute("content") or ""
-        match = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+Posts\b", content, flags=re.I)
+        content = (meta.get_attribute("content") or "").strip()
+        if not content:
+            continue
+
+        # Most robust case: English og:description like "123 posts, 4,567 followers..."
+        match = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+posts?\b", content, flags=re.I)
         if match:
-            return normalize_count_text(match.group(1))
+            count = normalize_count_text(match.group(1))
+            if count is not None:
+                return count
+
+        # Locale fallback: parse the first numeric token in og:description
+        match = re.search(r"^\s*([0-9][0-9,\.KMBkmb]*)\b", content)
+        if match:
+            count = normalize_count_text(match.group(1))
+            if count is not None:
+                return count
+
     return None
 
 
@@ -258,6 +299,11 @@ def get_profile_post_count(driver: webdriver.Chrome, username: str) -> int | Non
         EC.presence_of_element_located((By.TAG_NAME, "body"))
     )
     time.sleep(2)
+
+    count = extract_post_count_from_page_source(driver)
+    if count is not None:
+        print(f"ℹ️ {username} current profile post count (page_source): {count}")
+        return count
 
     count = extract_post_count_from_meta(driver)
     if count is not None:
