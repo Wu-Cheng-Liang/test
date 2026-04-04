@@ -12,12 +12,8 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     permissions:
       contents: write
-
-    env:
-      TZ: Asia/Taipei
 
     steps:
       - name: Checkout repository
@@ -37,11 +33,6 @@ jobs:
           chrome-version: stable
           install-chromedriver: true
 
-      - name: Show browser versions
-        run: |
-          "${{ steps.setup-chrome.outputs.chrome-path }}" --version
-          "${{ steps.setup-chrome.outputs.chromedriver-path }}" --version
-
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -57,29 +48,20 @@ jobs:
 
       - name: Ensure data files exist
         run: |
-          mkdir -p data data/debug
+          mkdir -p data
           [ -f data/reels_static_info.csv ] || printf "kol_account,reels_shortcode,post_time,duration,caption\n" > data/reels_static_info.csv
           [ -f data/reels_dynamic_info.csv ] || printf "reels_shortcode,views,plays,likes,comments,timestamp\n" > data/reels_dynamic_info.csv
           [ -f data/profile_post_state.csv ] || printf "kol_account,profile_post_count,last_checked_at,last_changed_at,check_status\n" > data/profile_post_state.csv
 
       - name: Run scraper
         env:
+          TZ: Asia/Taipei
           CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
           CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+          PROFILE_COUNT_WAIT_SECONDS: "10"
+          PROFILE_COUNT_POLL_SECONDS: "0.5"
         run: |
           python main.py
-
-      - name: Upload scrape artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scrape-debug
-          path: |
-            data/debug/
-            data/*.csv
-            *.log
-            /tmp/insta_debug.html
-          if-no-files-found: ignore
 
       - name: Commit and push CSV updates
         run: |
